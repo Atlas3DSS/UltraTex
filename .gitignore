@@ -19,3 +19,8 @@ events.out.tfevents.*
 
 # OS
 .DS_Store
+
+# Multi-view texture port: local outputs and data manifests
+*.pyc
+data/texverse_train.json
+data/texverse_eval.json

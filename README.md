@@ -259,3 +259,86 @@ The training dataset is available at [G-buffer TexVerse](https://huggingface.co/
 ## License
 
 This code is released under the [MIT License](./LICENSE).
+
+## Krea 2 and Qwen-Image 2.1 backbones (port)
+
+This fork adds two open-weight single-stream DiT backbones next to the FLUX
+ports, selected with `--backbone`:
+
+Trained weights for the Qwen-Image 2.1 backbone (LoRA, foreground-aware RGBA decoder, cached text conditioning) and sample textured meshes are on the Hugging Face Hub: https://huggingface.co/orwelian84/UltraTex-Qwen-Image-2.1. Drop its `qwen21/` folder into `checkpoints/qwen21/`.
+
+| Backbone | Weights | Latent | Tokens per 2K view | Conditioning |
+|---|---|---|---|---|
+| `krea2`  | Krea 2 Raw, 12.8B, 28 blocks, 6144 wide, GQA 48/12 | Qwen-Image / Wan 2.1 VAE, 16ch, 8x, 2x2 patch | 16,384 | Qwen3-VL-4B 12-layer tap (`txtfusion`), 3-axis RoPE (index, h, w), theta 1000 |
+| `qwen21` | Qwen-Image 2.1, 7.1B, 32 blocks, 4096 wide | Qwen-Image 2.1 RGBA VAE, 64ch, 16x, patch 1 | 16,384 | Qwen3-VL-8B last hidden state, block-causal prefix (text + references) modulated from t = 0, 3-axis RoPE (frame, h, w) |
+
+Everything UltraTex adds (background token dropping with preserved RoPE ids,
+SLA block-sparse attention, foreground-aware decoder, foreground-restricted
+flow matching, UNO-style shifted timestep sampling, 2x3 TexVerse canvases,
+length-aware bucketing) is shared in `ultratex/mv.py` and
+`ultratex/backbones/common.py`; the backbone modules under
+`ultratex/backbones/{krea2,qwen21}/` load the released checkpoints with
+`strict=True` and only change the sequence interface.
+
+Qwen-Image 2.1 specifics: the sequence is `[text, normal canvas, reference
+render, target canvas]`; the prefix is causal and timestep-independent, so at
+inference its K/V are computed once and cached across all sampling steps
+(`--use_prefix_cache`). With `--attention full` it trains bidirectionally like
+the FLUX ports. The RGBA VAE encodes the alpha channel directly, so the
+canonical background is white + transparent and the decoder's alpha is
+supervised too.
+
+Krea 2 specifics: the sequence is `[text, target canvas, normal canvas,
+reference render]` with the references on RoPE index planes 1 and 2 (the Krea 2
+edit-adapter convention); `--ref_timestep_zero` modulates reference tokens from
+t = 0.
+
+### Setup
+
+The scripts run inside a ComfyUI checkout that has Qwen-Image 2.1 support
+(ComfyUI is imported as a library for the VAEs and text encoders; no weights
+are converted). `scripts/mv_env.sh` holds the paths; override as needed:
+
+```bash
+export COMFY_ROOT=/path/to/ComfyUI          # with Qwen-Image 2.1 support (>= 2026-09-20)
+export MV_PYTHON=$COMFY_ROOT/.venv/bin/python
+export QWEN21_MODEL_PATH=.../qwen_image_2.1_bf16.safetensors
+export QWEN21_VAE_PATH=.../qwen_image_2.1_vae_bf16.safetensors
+export QWEN21_TEXT_ENCODER=.../qwen3vl_8b_bf16.safetensors
+export KREA2_MODEL_PATH=.../krea2_raw_bf16.safetensors       # Krea 2 Raw (train on Raw)
+export KREA2_VAE_PATH=.../qwen_image_vae.safetensors         # 16-channel Qwen-Image / Wan 2.1 VAE
+export KREA2_TEXT_ENCODER=.../qwen3vl_4b_bf16.safetensors
+```
+
+Prompts are the empty string for image-guided texturing, so the text
+conditioning is encoded once and cached (no text encoder at train time):
+
+```bash
+BACKBONE=qwen21 bash scripts/precompute_text_mv.sh     # -> checkpoints/qwen21/text_cond.safetensors
+BACKBONE=krea2  bash scripts/precompute_text_mv.sh     # -> checkpoints/krea2/text_cond.safetensors
+```
+
+### Data
+
+```bash
+# G-buffer TexVerse is gated: request access on Hugging Face first.
+hf download YiboZhang2001/G-buffer-TexVerse canonical/bsdf/00.zip --repo-type dataset --local-dir /data/texverse/zips
+python tools/prepare_texverse.py --zips /data/texverse/zips/canonical/bsdf --out /data/texverse/assets \
+    --train-json data/texverse_train.json --eval-json data/texverse_eval.json --eval-count 32
+```
+
+### Train / infer
+
+```bash
+BACKBONE=qwen21 bash scripts/train_vae_mv.sh                                   # foreground-aware RGBA decoder
+BACKBONE=qwen21 RESOLUTION=1024 TRAIN_JSON=data/texverse_train.json \
+    EVAL_JSON=data/texverse_eval.json BUCKET_METADATA_JSON=/data/texverse/assets/foreground_ratios.json \
+    DECODER_CKPT=outputs/train_vae_qwen21/decoder_step3000.safetensors bash scripts/train_mv.sh
+BACKBONE=qwen21 LORA=outputs/train_qwen21_albedo_res=1024_lr=5e-5/checkpoint-20000 \
+    DECODER_CKPT=outputs/train_vae_qwen21/decoder_step3000.safetensors bash scripts/inference_mv.sh
+```
+
+`BACKBONE=krea2` selects Krea 2 everywhere. Unit tests for the sequence
+layout, block-causal attention and prefix caching: `python -m pytest tests/`.
+On the Atlas fleet, `scripts/mv_leased_run.sh` runs a command on a workboard
+lease as a detached systemd user unit with heartbeats.
